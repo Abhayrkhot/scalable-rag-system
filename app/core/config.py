@@ -41,6 +41,38 @@ class Settings(BaseSettings):
     prometheus_port: int = Field(8001, env="PROMETHEUS_PORT")
     log_level: str = Field("INFO", env="LOG_LEVEL")
     
+    # Security Configuration
+    max_request_size_mb: int = Field(10, env="MAX_REQUEST_SIZE_MB")
+    rate_limit_per_minute: int = Field(100, env="RATE_LIMIT_PER_MINUTE")
+    allowed_file_types: str = Field("pdf,txt,md,markdown", env="ALLOWED_FILE_TYPES")
+    
+    # Hybrid Search Configuration
+    elasticsearch_host: str = Field("localhost", env="ELASTICSEARCH_HOST")
+    elasticsearch_port: int = Field(9200, env="ELASTICSEARCH_PORT")
+    enable_hybrid_search: bool = Field(True, env="ENABLE_HYBRID_SEARCH")
+    
+    # Reranking Configuration
+    reranker_type: str = Field("cross_encoder", env="RERANKER_TYPE")  # cross_encoder, bge_reranker, cohere
+    reranker_cache_ttl: int = Field(3600, env="RERANKER_CACHE_TTL")
+    cohere_api_key: Optional[str] = Field(None, env="COHERE_API_KEY")
+    
+    # Guardrails Configuration
+    max_tokens: int = Field(4000, env="MAX_TOKENS")
+    max_context_tokens: int = Field(8000, env="MAX_CONTEXT_TOKENS")
+    require_citations: bool = Field(True, env="REQUIRE_CITATIONS")
+    forbid_unverifiable: bool = Field(True, env="FORBID_UNVERIFIABLE")
+    min_confidence_threshold: float = Field(0.3, env="MIN_CONFIDENCE_THRESHOLD")
+    max_sources: int = Field(10, env="MAX_SOURCES")
+    
+    # Evaluation Configuration
+    enable_evaluation: bool = Field(True, env="ENABLE_EVALUATION")
+    evaluation_dataset_path: str = Field("./evaluation_data", env="EVALUATION_DATASET_PATH")
+    
+    # Performance Configuration
+    enable_caching: bool = Field(True, env="ENABLE_CACHING")
+    cache_ttl: int = Field(3600, env="CACHE_TTL")
+    enable_streaming: bool = Field(True, env="ENABLE_STREAMING")
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

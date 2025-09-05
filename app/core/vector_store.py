@@ -4,7 +4,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 import pinecone
-from langchain.vectorstores import Chroma, Pinecone
+from langchain_chroma import Chroma
+from langchain_pinecone import PineconeVectorStore
 from langchain.schema import Document
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential

@@ -4,7 +4,8 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 from openai import AsyncOpenAI
 from sentence_transformers import SentenceTransformer
-from langchain.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.schema import Document
 import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -24,12 +25,14 @@ class EmbeddingService:
         if self.embedding_model.startswith("text-embedding"):
             self.embeddings = OpenAIEmbeddings(
                 model=self.embedding_model,
-                openai_api_key=settings.openai_api_key
+                openai_api_key=settings.openai_api_key,
+                chunk_size=self.batch_size
             )
         else:
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=self.embedding_model,
-                model_kwargs={'device': 'cpu'}
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
             )
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
