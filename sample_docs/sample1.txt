@@ -1,0 +1,8 @@
+Retrieval-Augmented Generation (RAG) is a technique that combines information retrieval with generative models to answer questions using both stored knowledge and external documents. This approach improves factual accuracy and transparency in AI systems.
+
+RAG systems typically consist of three main components:
+1. A document store or knowledge base
+2. A retrieval system that finds relevant documents
+3. A generative model that synthesizes answers
+
+The process works by first retrieving relevant documents from a knowledge base based on the input query, then using those documents as context for a language model to generate a more accurate and grounded response.
