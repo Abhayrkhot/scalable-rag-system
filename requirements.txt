@@ -26,3 +26,10 @@ tiktoken==0.5.2
 numpy==1.24.4
 pandas==2.1.4
 aiofiles==23.2.1
+faker==20.1.0
+wikipedia==1.4.0
+reportlab==4.0.7
+PyPDF2==3.0.1
+pymupdf==1.23.8
+tqdm==4.66.1
+aiohttp==3.9.1

@@ -6,8 +6,9 @@ import structlog
 import time
 from datetime import datetime
 
-from app.routers import ingest, query
+from app.routers import ingest, query, massive_ingestion, advanced_query
 from app.core.config import settings
+from app.utils.monitoring import start_monitoring
 
 # Configure structured logging
 structlog.configure(
@@ -32,9 +33,9 @@ logger = structlog.get_logger()
 
 # Create FastAPI app
 app = FastAPI(
-    title="Scalable RAG System",
-    description="A high-performance Retrieval-Augmented Generation system for millions of documents",
-    version="1.0.0",
+    title="Scalable RAG System - Million Document Processing",
+    description="A high-performance Retrieval-Augmented Generation system designed to handle millions of documents with enterprise-grade scalability, precision, and monitoring",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -84,17 +85,27 @@ async def log_requests(request: Request, call_next):
 # Include routers
 app.include_router(ingest.router)
 app.include_router(query.router)
+app.include_router(massive_ingestion.router)
+app.include_router(advanced_query.router)
 
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with system status"""
     return {
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0.0",
+        "version": "2.0.0",
         "vector_db_provider": settings.vector_db_provider,
-        "embedding_model": settings.embedding_model
+        "embedding_model": settings.embedding_model,
+        "features": [
+            "million-document-processing",
+            "advanced-query-precision",
+            "hybrid-search",
+            "query-expansion",
+            "reranking",
+            "prometheus-monitoring"
+        ]
     }
 
 # Root endpoint
@@ -102,10 +113,24 @@ async def health_check():
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Scalable RAG System API",
-        "version": "1.0.0",
+        "message": "Scalable RAG System - Million Document Processing",
+        "version": "2.0.0",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "endpoints": {
+            "basic_ingestion": "/ingest/",
+            "basic_query": "/query/",
+            "massive_ingestion": "/massive/",
+            "advanced_query": "/advanced-query/"
+        },
+        "capabilities": [
+            "Process 1+ million documents",
+            "Advanced precision querying",
+            "Hybrid search (semantic + keyword)",
+            "Query expansion and reranking",
+            "Real-time monitoring",
+            "Cloud deployment ready"
+        ]
     }
 
 # Global exception handler
@@ -130,15 +155,22 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting Scalable RAG System", version="1.0.0")
-    logger.info("Configuration loaded", 
+    logger.info("Starting Scalable RAG System v2.0.0", 
+                version="2.0.0",
                 vector_db=settings.vector_db_provider,
                 embedding_model=settings.embedding_model)
+    
+    # Start monitoring
+    try:
+        start_monitoring(settings.prometheus_port)
+        logger.info(f"Prometheus metrics server started on port {settings.prometheus_port}")
+    except Exception as e:
+        logger.warning(f"Failed to start metrics server: {e}")
 
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Shutting down Scalable RAG System")
+    logger.info("Shutting down Scalable RAG System v2.0.0")
 
 if __name__ == "__main__":
     import uvicorn
