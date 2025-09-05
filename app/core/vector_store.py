@@ -17,6 +17,8 @@ logger = structlog.get_logger()
 class VectorStoreManager:
     def __init__(self):
         self.provider = settings.vector_db_provider
+        self.client = None
+        self.index = None
         self._initialize_vector_store()
     
     def _initialize_vector_store(self):
@@ -32,7 +34,7 @@ class VectorStoreManager:
             # Ensure directory exists
             os.makedirs(settings.chroma_persist_directory, exist_ok=True)
             
-            self.chroma_client = chromadb.PersistentClient(
+            self.client = chromadb.PersistentClient(
                 path=settings.chroma_persist_directory,
                 settings=ChromaSettings(
                     anonymized_telemetry=False,
@@ -64,7 +66,7 @@ class VectorStoreManager:
                 )
                 logger.info(f"Created Pinecone index: {settings.pinecone_index_name}")
             
-            self.pinecone_index = pinecone.Index(settings.pinecone_index_name)
+            self.index = pinecone.Index(settings.pinecone_index_name)
             logger.info(f"Pinecone initialized with index: {settings.pinecone_index_name}")
         except Exception as e:
             logger.error(f"Failed to initialize Pinecone: {e}")
@@ -87,9 +89,9 @@ class VectorStoreManager:
         try:
             # Get or create collection
             try:
-                collection = self.chroma_client.get_collection(collection_name)
+                collection = self.client.get_collection(collection_name)
             except:
-                collection = self.chroma_client.create_collection(
+                collection = self.client.create_collection(
                     name=collection_name,
                     metadata={"hnsw:space": "cosine"}
                 )
@@ -135,7 +137,7 @@ class VectorStoreManager:
             batch_size = 100
             for i in range(0, len(vectors), batch_size):
                 batch = vectors[i:i + batch_size]
-                self.pinecone_index.upsert(vectors=batch)
+                self.index.upsert(vectors=batch)
                 logger.info(f"Upserted batch {i//batch_size + 1} to Pinecone")
             
             logger.info(f"Added {len(documents)} documents to Pinecone collection: {collection_name}")
@@ -161,7 +163,7 @@ class VectorStoreManager:
                            top_k: int, filter: Optional[Dict]) -> List[Tuple[Document, float]]:
         """Search ChromaDB"""
         try:
-            collection = self.chroma_client.get_collection(collection_name)
+            collection = self.client.get_collection(collection_name)
             
             results = collection.query(
                 query_embeddings=[query_embedding],
@@ -193,7 +195,7 @@ class VectorStoreManager:
             if filter:
                 search_filter.update(filter)
             
-            results = self.pinecone_index.query(
+            results = self.index.query(
                 vector=query_embedding,
                 top_k=top_k,
                 include_metadata=True,
@@ -214,18 +216,45 @@ class VectorStoreManager:
             logger.error(f"Error searching Pinecone: {e}")
             raise
     
+    async def delete_by_source(self, collection_name: str, source: str, version: Optional[str] = None) -> bool:
+        """Delete all documents from a specific source"""
+        try:
+            if self.provider == "pinecone":
+                # Pinecone delete by filter
+                filter_dict = {"source": source}
+                if version:
+                    filter_dict["version"] = version
+                
+                self.index.delete(filter=filter_dict, namespace=collection_name)
+                logger.info(f"Deleted documents from source {source} in Pinecone collection {collection_name}")
+            else:
+                # ChromaDB delete by where clause
+                collection = self.client.get_collection(collection_name)
+                where_clause = {"source": source}
+                if version:
+                    where_clause["version"] = version
+                
+                collection.delete(where=where_clause)
+                logger.info(f"Deleted documents from source {source} in ChromaDB collection {collection_name}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting documents by source: {e}")
+            return False
+    
     async def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
         """Get information about a collection"""
         try:
             if self.provider == "pinecone":
-                stats = self.pinecone_index.describe_index_stats()
+                stats = self.index.describe_index_stats()
                 return {
                     "name": collection_name,
                     "total_vectors": stats.get('total_vector_count', 0),
                     "dimension": stats.get('dimension', 0)
                 }
             else:
-                collection = self.chroma_client.get_collection(collection_name)
+                collection = self.client.get_collection(collection_name)
                 count = collection.count()
                 return {
                     "name": collection_name,
@@ -244,7 +273,7 @@ class VectorStoreManager:
                 logger.warning("Pinecone collection deletion not implemented")
                 return False
             else:
-                self.chroma_client.delete_collection(collection_name)
+                self.client.delete_collection(collection_name)
                 logger.info(f"Deleted ChromaDB collection: {collection_name}")
                 return True
         except Exception as e:

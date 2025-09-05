@@ -1,95 +1,77 @@
 import asyncio
-import time
 import logging
 from typing import List, Dict, Any, Optional
-from pathlib import Path
 import structlog
+from pathlib import Path
 
-from app.core.document_processor import DocumentProcessor
+from app.core.document_processor import load_document, clean_text, chunk_document
 from app.core.embedding_service import EmbeddingService
 from app.core.vector_store import VectorStoreManager
 from app.core.config import settings
+from app.utils.monitoring import record_ingestion_metrics
 
 logger = structlog.get_logger()
 
 class IngestionService:
     def __init__(self):
-        self.document_processor = DocumentProcessor(
-            chunk_size=settings.chunk_size,
-            chunk_overlap=settings.chunk_overlap
-        )
         self.embedding_service = EmbeddingService()
         self.vector_store = VectorStoreManager()
     
-    async def ingest_documents(self, file_paths: List[str], collection_name: str, 
-                             batch_size: int = 100, force_reindex: bool = False) -> Dict[str, Any]:
-        """Main ingestion pipeline for processing documents"""
-        start_time = time.time()
-        errors = []
-        documents_processed = 0
-        chunks_created = 0
+    async def ingest_documents(self, file_paths: List[str], collection_name: str,
+                              chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
+        """Ingest documents into the RAG system"""
+        start_time = asyncio.get_event_loop().time()
         
         try:
-            # Validate file paths
-            valid_paths = await self._validate_file_paths(file_paths)
-            if not valid_paths:
-                return {
-                    "success": False,
-                    "collection_name": collection_name,
-                    "documents_processed": 0,
-                    "chunks_created": 0,
-                    "processing_time_seconds": 0,
-                    "errors": ["No valid files found"]
-                }
+            logger.info(f"Starting ingestion of {len(file_paths)} files into collection '{collection_name}'")
             
-            logger.info(f"Starting ingestion of {len(valid_paths)} files into collection '{collection_name}'")
-            
-            # Process documents in batches
             all_documents = []
-            for i in range(0, len(valid_paths), batch_size):
-                batch_paths = valid_paths[i:i + batch_size]
-                batch_docs = await self.document_processor.process_files(batch_paths, batch_size)
-                all_documents.extend(batch_docs)
-                documents_processed += len(batch_paths)
-                
-                logger.info(f"Processed batch {i//batch_size + 1}, total chunks: {len(all_documents)}")
+            all_embeddings = []
+            processed_files = 0
+            
+            for file_path in file_paths:
+                try:
+                    # Load and process document
+                    doc_result = await self.load_and_process_document(
+                        file_path, collection_name, chunk_size, chunk_overlap
+                    )
+                    
+                    all_documents.extend(doc_result['documents'])
+                    all_embeddings.extend(doc_result['embeddings'])
+                    processed_files += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error processing file {file_path}: {e}")
+                    continue
             
             if not all_documents:
                 return {
                     "success": False,
-                    "collection_name": collection_name,
-                    "documents_processed": documents_processed,
+                    "error": "No documents were successfully processed",
+                    "documents_processed": 0,
                     "chunks_created": 0,
-                    "processing_time_seconds": time.time() - start_time,
-                    "errors": ["No documents could be processed"]
+                    "processing_time_seconds": 0
                 }
             
-            # Generate embeddings
-            logger.info(f"Generating embeddings for {len(all_documents)} chunks")
-            embedded_documents = await self.embedding_service.embed_documents_async(all_documents)
-            chunks_created = len(embedded_documents)
-            
-            # Extract embeddings for vector store
-            embeddings = [doc.metadata.get("embedding") for doc in embedded_documents]
-            
             # Store in vector database
-            logger.info(f"Storing {chunks_created} chunks in vector database")
             success = await self.vector_store.add_documents(
-                collection_name, embedded_documents, embeddings
+                collection_name, all_documents, all_embeddings
             )
             
-            if not success:
-                errors.append("Failed to store documents in vector database")
+            processing_time = asyncio.get_event_loop().time() - start_time
             
-            processing_time = time.time() - start_time
+            # Record metrics
+            record_ingestion_metrics(
+                collection_name, "mixed", len(all_documents), 
+                len(all_documents), processing_time
+            )
             
             result = {
-                "success": success and not errors,
-                "collection_name": collection_name,
-                "documents_processed": documents_processed,
-                "chunks_created": chunks_created,
+                "success": success,
+                "documents_processed": processed_files,
+                "chunks_created": len(all_documents),
                 "processing_time_seconds": round(processing_time, 2),
-                "errors": errors
+                "collection_name": collection_name
             }
             
             logger.info(f"Ingestion completed: {result}")
@@ -99,60 +81,57 @@ class IngestionService:
             logger.error(f"Ingestion failed: {e}")
             return {
                 "success": False,
-                "collection_name": collection_name,
-                "documents_processed": documents_processed,
-                "chunks_created": chunks_created,
-                "processing_time_seconds": round(time.time() - start_time, 2),
-                "errors": [str(e)]
+                "error": str(e),
+                "documents_processed": 0,
+                "chunks_created": 0,
+                "processing_time_seconds": 0
             }
     
-    async def _validate_file_paths(self, file_paths: List[str]) -> List[str]:
-        """Validate and filter file paths"""
-        valid_paths = []
-        
-        for path in file_paths:
-            try:
-                file_path = Path(path)
-                if not file_path.exists():
-                    logger.warning(f"File not found: {path}")
-                    continue
-                
-                if not file_path.is_file():
-                    logger.warning(f"Path is not a file: {path}")
-                    continue
-                
-                # Check file size
-                file_size_mb = file_path.stat().st_size / (1024 * 1024)
-                if file_size_mb > settings.max_file_size_mb:
-                    logger.warning(f"File too large ({file_size_mb:.2f}MB): {path}")
-                    continue
-                
-                # Check file extension
-                if file_path.suffix.lower() not in ['.pdf', '.md', '.markdown', '.txt', '.text']:
-                    logger.warning(f"Unsupported file type: {path}")
-                    continue
-                
-                valid_paths.append(str(file_path))
-                
-            except Exception as e:
-                logger.warning(f"Error validating {path}: {e}")
-                continue
-        
-        return valid_paths
+    async def load_and_process_document(self, file_path: str, collection_name: str,
+                                      chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
+        """Load and process a single document"""
+        try:
+            # Load document
+            document = load_document(file_path)
+            
+            # Clean text
+            cleaned_doc = clean_text(document)
+            
+            # Chunk document
+            chunks = chunk_document(cleaned_doc, chunk_size, chunk_overlap)
+            
+            # Generate embeddings
+            embeddings = await self.embedding_service.embed_documents_batch(chunks)
+            
+            return {
+                "documents": chunks,
+                "embeddings": embeddings
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing document {file_path}: {e}")
+            raise
     
     async def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
-        """Get information about a collection"""
+        """Get collection information"""
         try:
-            info = await self.vector_store.get_collection_info(collection_name)
-            return info
+            return await self.vector_store.get_collection_info(collection_name)
         except Exception as e:
             logger.error(f"Error getting collection info: {e}")
-            return {"name": collection_name, "total_vectors": 0, "dimension": 0}
+            return {"error": str(e)}
     
-    async def delete_collection(self, collection_name: str) -> bool:
-        """Delete a collection"""
+    async def list_collections(self) -> List[Dict[str, Any]]:
+        """List all collections"""
         try:
-            return await self.vector_store.delete_collection(collection_name)
+            # This would list all collections from the vector store
+            # For now, return placeholder
+            return [
+                {
+                    "name": "default",
+                    "document_count": 0,
+                    "status": "active"
+                }
+            ]
         except Exception as e:
-            logger.error(f"Error deleting collection: {e}")
-            return False
+            logger.error(f"Error listing collections: {e}")
+            return []

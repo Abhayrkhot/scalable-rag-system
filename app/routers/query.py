@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import structlog
@@ -73,32 +74,42 @@ async def query_documents_streaming(
         async def generate_stream():
             try:
                 # Send initial metadata
-                yield f"data: {json.dumps({'type': 'start', 'message': 'Starting query processing...'})}\n\n"
+                yield {
+                    "event": "start",
+                    "data": json.dumps({"message": "Starting query processing..."})
+                }
                 
                 # Stream the answer
-                async for chunk in query_service.answer_question_streaming(
+                async for token in query_service.answer_question_streaming(
                     question=request.question,
                     collection_name=request.collection_name,
                     top_k=request.top_k,
                     use_hybrid=request.use_hybrid,
                     use_reranking=request.use_reranking
                 ):
-                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    yield {
+                        "event": "token",
+                        "data": json.dumps({"content": token})
+                    }
                 
                 # Send completion signal
-                yield f"data: {json.dumps({'type': 'done', 'message': 'Query completed'})}\n\n"
+                yield {
+                    "event": "done",
+                    "data": json.dumps({"message": "Query completed"})
+                }
                 
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
-                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+                yield {
+                    "event": "error",
+                    "data": json.dumps({"error": str(e)})
+                }
         
-        return StreamingResponse(
+        return EventSourceResponse(
             generate_stream(),
-            media_type="text/plain",
             headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Content-Type": "text/event-stream"
+                "Connection": "keep-alive"
             }
         )
         

@@ -1,7 +1,7 @@
 import asyncio
 import time
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, AsyncGenerator
 import structlog
 from openai import AsyncOpenAI
 
@@ -11,7 +11,12 @@ from app.core.hybrid_search import HybridSearchEngine
 from app.core.reranking_service import RerankingService
 from app.core.query_planner import QueryPlanner
 from app.core.prompts import PromptTemplates
+from app.core.cache import CacheService
 from app.core.config import settings
+from app.utils.monitoring import (
+    record_query_metrics, record_embedding_metrics, record_vector_store_metrics,
+    record_cache_metrics, record_stage_duration, metrics_collector
+)
 
 logger = structlog.get_logger()
 
@@ -23,6 +28,7 @@ class QueryService:
         self.reranking_service = RerankingService()
         self.query_planner = QueryPlanner()
         self.prompt_templates = PromptTemplates()
+        self.cache_service = CacheService()
         self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
     
     async def answer_question(self, question: str, collection_name: str, 
@@ -102,6 +108,9 @@ class QueryService:
             processing_time = time.time() - start_time
             latency_breakdown["total"] = processing_time
             
+            # Record metrics
+            record_query_metrics(collection_name, "hybrid" if use_hybrid else "vector", len(documents), processing_time)
+            
             result = {
                 "answer": answer,
                 "sources": sources,
@@ -145,8 +154,8 @@ class QueryService:
             )
             
             # Blend results
-            blended_results = await self.hybrid_search.hybrid_search(
-                collection_name, question, vector_results, top_k,
+            blended_results = await self.hybrid_search.blend(
+                question, vector_results, bm25_results, top_k,
                 semantic_weight=plan.get("vector_weight", 0.7),
                 keyword_weight=plan.get("bm25_weight", 0.3)
             )

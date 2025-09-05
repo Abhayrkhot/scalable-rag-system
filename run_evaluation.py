@@ -6,14 +6,15 @@ import asyncio
 import os
 import sys
 import json
+import argparse
 from pathlib import Path
 
 # Add the app directory to Python path
 sys.path.append(str(Path(__file__).parent))
 
 from app.evaluation.ragas_evaluator import EvaluationHarness
-from app.services.advanced_query_service import AdvancedQueryService
-from app.services.massive_ingestion_service import MassiveIngestionService
+from app.services.query_service import QueryService
+from app.services.ingestion_service import IngestionService
 import structlog
 
 # Configure logging
@@ -34,16 +35,19 @@ logger = structlog.get_logger()
 class RAGEvaluator:
     def __init__(self):
         self.evaluation_harness = EvaluationHarness()
-        self.query_service = AdvancedQueryService()
-        self.ingestion_service = MassiveIngestionService()
+        self.query_service = QueryService()
+        self.ingestion_service = IngestionService()
     
-    async def run_comprehensive_evaluation(self):
+    async def run_comprehensive_evaluation(self, dataset_path: str = None):
         """Run comprehensive evaluation suite"""
         print("🔍 Starting Comprehensive RAG Evaluation")
         print("=" * 50)
         
-        # Test data for evaluation
-        test_data = await self._prepare_test_data()
+        # Load test data
+        if dataset_path and os.path.exists(dataset_path):
+            test_data = await self._load_dataset(dataset_path)
+        else:
+            test_data = await self._prepare_test_data()
         
         # Run evaluation
         results = await self.evaluation_harness.run_comprehensive_evaluation(test_data)
@@ -56,7 +60,42 @@ class RAGEvaluator:
         
         return results
     
-    async def _prepare_test_data(self):
+    async def _load_dataset(self, dataset_path: str) -> Dict[str, Any]:
+        """Load evaluation dataset from file"""
+        try:
+            with open(dataset_path, 'r') as f:
+                if dataset_path.endswith('.json'):
+                    return json.load(f)
+                elif dataset_path.endswith('.jsonl'):
+                    data = []
+                    for line in f:
+                        data.append(json.loads(line.strip()))
+                    return self._convert_jsonl_to_test_data(data)
+        except Exception as e:
+            logger.error(f"Error loading dataset: {e}")
+            return await self._prepare_test_data()
+    
+    def _convert_jsonl_to_test_data(self, data: List[Dict]) -> Dict[str, Any]:
+        """Convert JSONL data to test data format"""
+        questions = []
+        ground_truths = []
+        answers = []
+        contexts = []
+        
+        for item in data:
+            questions.append(item.get('question', ''))
+            ground_truths.append(item.get('ground_truth', item.get('answer', '')))
+            answers.append(item.get('answer', ''))
+            contexts.append(item.get('context', []))
+        
+        return {
+            "questions": questions,
+            "ground_truths": ground_truths,
+            "answers": answers,
+            "contexts": contexts
+        }
+    
+    async def _prepare_test_data(self) -> Dict[str, Any]:
         """Prepare test data for evaluation"""
         # Sample questions and expected answers
         questions = [
@@ -81,13 +120,13 @@ class RAGEvaluator:
         
         for question in questions:
             try:
-                result = await self.query_service.answer_question_advanced(
+                result = await self.query_service.answer_question(
                     question=question,
                     collection_name="test_collection",
                     top_k=5,
                     use_reranking=True,
                     use_query_expansion=True,
-                    use_hybrid_search=True
+                    use_hybrid=True
                 )
                 
                 answers.append(result["answer"])
@@ -144,13 +183,52 @@ class RAGEvaluator:
             json.dump(results, f, indent=2, default=str)
         
         print(f"\n💾 Results saved to {results_file}")
+        
+        # Also save markdown report
+        self._save_markdown_report(results)
+    
+    def _save_markdown_report(self, results):
+        """Save markdown report"""
+        report_file = Path("reports/evaluation_report.md")
+        report_file.parent.mkdir(exist_ok=True)
+        
+        with open(report_file, 'w') as f:
+            f.write("# RAG System Evaluation Report\n\n")
+            f.write(f"Generated on: {asyncio.get_event_loop().time()}\n\n")
+            
+            if "ragas" in results:
+                ragas = results["ragas"]
+                f.write("## RAGAS Metrics\n\n")
+                f.write(f"**Overall Score:** {ragas.get('overall_score', 0):.3f}\n\n")
+                
+                f.write("### Detailed Metrics\n\n")
+                for metric, score in ragas.get('metrics', {}).items():
+                    f.write(f"- **{metric}:** {score:.3f}\n")
+                
+                f.write("\n### Recommendations\n\n")
+                for rec in ragas.get('recommendations', []):
+                    f.write(f"- {rec}\n")
+            
+            if "retrieval" in results:
+                retrieval = results["retrieval"]
+                f.write("\n## Retrieval Metrics\n\n")
+                for metric, score in retrieval.items():
+                    f.write(f"- **{metric}:** {score:.3f}\n")
+        
+        print(f"📄 Markdown report saved to {report_file}")
 
 async def main():
     """Main evaluation function"""
+    parser = argparse.ArgumentParser(description="Run RAG system evaluation")
+    parser.add_argument("--dataset", help="Path to evaluation dataset (JSON/JSONL)")
+    parser.add_argument("--collection", default="test_collection", help="Collection name to test")
+    
+    args = parser.parse_args()
+    
     evaluator = RAGEvaluator()
     
     try:
-        results = await evaluator.run_comprehensive_evaluation()
+        results = await evaluator.run_comprehensive_evaluation(args.dataset)
         print("\n✅ Evaluation completed successfully!")
         
         # Check if results meet minimum thresholds
@@ -158,10 +236,16 @@ async def main():
             overall_score = results["ragas"].get("overall_score", 0)
             if overall_score >= 0.7:
                 print("🎉 System performance is excellent!")
+                sys.exit(0)
             elif overall_score >= 0.5:
                 print("👍 System performance is good")
+                sys.exit(0)
             else:
                 print("⚠️  System performance needs improvement")
+                sys.exit(1)
+        else:
+            print("❌ No evaluation results generated")
+            sys.exit(1)
         
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")

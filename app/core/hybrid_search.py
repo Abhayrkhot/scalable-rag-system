@@ -195,16 +195,13 @@ class HybridSearchEngine:
             logger.error(f"Error in BM25 search: {e}")
             return []
     
-    async def hybrid_search(self, collection_name: str, query: str, 
-                          vector_results: List[Tuple[Any, float]], 
-                          top_k: int = 10, 
-                          semantic_weight: float = 0.7,
-                          keyword_weight: float = 0.3) -> List[Tuple[Any, float]]:
-        """Combine semantic and keyword search results"""
+    async def blend(self, query: str, vector_results: List[Tuple[Any, float]], 
+                   bm25_results: List[Tuple[Dict[str, Any], float]], 
+                   top_k: int = 10, 
+                   semantic_weight: float = 0.7,
+                   keyword_weight: float = 0.3) -> List[Tuple[Any, float]]:
+        """Blend BM25 and vector search results"""
         try:
-            # Get BM25 results
-            bm25_results = await self.bm25_search(collection_name, query, top_k * 2)
-            
             if not bm25_results:
                 # Fallback to vector results only
                 return vector_results[:top_k]
@@ -267,7 +264,7 @@ class HybridSearchEngine:
             return hybrid_results[:top_k]
             
         except Exception as e:
-            logger.error(f"Error in hybrid search: {e}")
+            logger.error(f"Error in hybrid search blend: {e}")
             return vector_results[:top_k]
     
     def _get_doc_id(self, doc) -> str:
