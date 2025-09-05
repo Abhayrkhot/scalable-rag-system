@@ -7,6 +7,10 @@ from openai import AsyncOpenAI
 
 from app.core.embedding_service import EmbeddingService
 from app.core.vector_store import VectorStoreManager
+from app.core.hybrid_search import HybridSearchEngine
+from app.core.reranking_service import RerankingService
+from app.core.query_planner import QueryPlanner
+from app.core.prompts import PromptTemplates
 from app.core.config import settings
 
 logger = structlog.get_logger()
@@ -15,54 +19,99 @@ class QueryService:
     def __init__(self):
         self.embedding_service = EmbeddingService()
         self.vector_store = VectorStoreManager()
+        self.hybrid_search = HybridSearchEngine()
+        self.reranking_service = RerankingService()
+        self.query_planner = QueryPlanner()
+        self.prompt_templates = PromptTemplates()
         self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
     
     async def answer_question(self, question: str, collection_name: str, 
-                            top_k: int = 5, rerank: bool = True, 
-                            include_metadata: bool = True) -> Dict[str, Any]:
-        """Main query processing pipeline"""
+                            top_k: int = 10, use_hybrid: bool = True, 
+                            use_reranking: bool = True, use_query_expansion: bool = True,
+                            use_planning: bool = True) -> Dict[str, Any]:
+        """Answer question with hybrid search and reranking by default"""
         start_time = time.time()
+        latency_breakdown = {}
         
         try:
             logger.info(f"Processing question: '{question[:100]}...' in collection '{collection_name}'")
             
+            # Query planning
+            if use_planning:
+                plan_start = time.time()
+                plan = self.query_planner.get_optimal_params(question)
+                latency_breakdown["planning"] = time.time() - plan_start
+                
+                # Override parameters with planned values
+                top_k = plan.get("top_k", top_k)
+                use_hybrid = plan.get("use_hybrid", use_hybrid)
+                use_reranking = plan.get("use_reranking", use_reranking)
+                use_query_expansion = plan.get("use_expansion", use_query_expansion)
+            else:
+                plan = {"confidence": 0.5}
+            
             # Generate query embedding
+            embed_start = time.time()
             query_embedding = await self.embedding_service.embed_query(question)
+            latency_breakdown["embedding"] = time.time() - embed_start
             
-            # Retrieve similar documents
-            similar_docs = await self.vector_store.similarity_search(
-                collection_name, query_embedding, top_k
-            )
+            # Retrieve documents
+            if use_hybrid:
+                retrieval_start = time.time()
+                documents = await self._hybrid_retrieval(
+                    question, query_embedding, collection_name, top_k, plan
+                )
+                latency_breakdown["retrieval"] = time.time() - retrieval_start
+            else:
+                retrieval_start = time.time()
+                documents = await self.vector_store.similarity_search(
+                    collection_name, query_embedding, top_k
+                )
+                latency_breakdown["retrieval"] = time.time() - retrieval_start
             
-            if not similar_docs:
+            if not documents:
                 return {
                     "answer": "No relevant documents found for your question.",
                     "sources": [],
+                    "contexts": [],
                     "confidence_score": 0.0,
                     "processing_time_seconds": round(time.time() - start_time, 2),
-                    "tokens_used": 0
+                    "tokens_used": 0,
+                    "latency_breakdown": latency_breakdown,
+                    "search_strategy": "hybrid" if use_hybrid else "vector_only"
                 }
             
-            # Rerank if requested
-            if rerank and len(similar_docs) > 1:
-                similar_docs = await self._rerank_documents(question, similar_docs)
+            # Rerank documents
+            if use_reranking and len(documents) > 1:
+                rerank_start = time.time()
+                documents = await self.reranking_service.rerank_documents(
+                    question, documents, plan.get("rerank_top_k", 5)
+                )
+                latency_breakdown["reranking"] = time.time() - rerank_start
             
-            # Generate answer using LLM
-            answer, sources, tokens_used = await self._generate_answer(
-                question, similar_docs, include_metadata
+            # Generate answer
+            generation_start = time.time()
+            answer, sources, contexts, tokens_used = await self._generate_answer(
+                question, documents
             )
+            latency_breakdown["generation"] = time.time() - generation_start
             
             # Calculate confidence score
-            confidence_score = self._calculate_confidence(similar_docs)
+            confidence_score = self._calculate_confidence(documents, plan.get("confidence", 0.5))
             
             processing_time = time.time() - start_time
+            latency_breakdown["total"] = processing_time
             
             result = {
                 "answer": answer,
                 "sources": sources,
+                "contexts": contexts,
                 "confidence_score": confidence_score,
                 "processing_time_seconds": round(processing_time, 2),
-                "tokens_used": tokens_used
+                "tokens_used": tokens_used,
+                "latency_breakdown": latency_breakdown,
+                "search_strategy": "hybrid_reranked" if use_hybrid and use_reranking else "vector_only",
+                "query_plan": plan
             }
             
             logger.info(f"Query processed in {processing_time:.2f}s, confidence: {confidence_score:.2f}")
@@ -73,126 +122,188 @@ class QueryService:
             return {
                 "answer": f"Error processing your question: {str(e)}",
                 "sources": [],
+                "contexts": [],
                 "confidence_score": 0.0,
                 "processing_time_seconds": round(time.time() - start_time, 2),
-                "tokens_used": 0
+                "tokens_used": 0,
+                "latency_breakdown": latency_breakdown,
+                "search_strategy": "error"
             }
     
-    async def _rerank_documents(self, question: str, documents: List[Tuple[Any, float]]) -> List[Tuple[Any, float]]:
-        """Rerank documents using a more sophisticated approach"""
+    async def _hybrid_retrieval(self, question: str, query_embedding: List[float], 
+                               collection_name: str, top_k: int, plan: Dict[str, Any]) -> List[Tuple[Any, float]]:
+        """Perform hybrid retrieval with BM25 and vector search"""
         try:
-            # Simple reranking based on text similarity and metadata quality
-            reranked = []
-            for doc, score in documents:
-                # Boost score based on text length and metadata quality
-                text_length = len(doc.page_content)
-                metadata_score = self._calculate_metadata_score(doc.metadata)
-                
-                # Weighted reranking
-                rerank_score = score * 0.7 + (text_length / 1000) * 0.2 + metadata_score * 0.1
-                reranked.append((doc, rerank_score))
+            # Get vector results
+            vector_results = await self.vector_store.similarity_search(
+                collection_name, query_embedding, top_k * 2
+            )
             
-            # Sort by rerank score
-            reranked.sort(key=lambda x: x[1], reverse=True)
-            return reranked
+            # Get BM25 results
+            bm25_results = await self.hybrid_search.bm25_search(
+                collection_name, question, top_k * 2
+            )
+            
+            # Blend results
+            blended_results = await self.hybrid_search.hybrid_search(
+                collection_name, question, vector_results, top_k,
+                semantic_weight=plan.get("vector_weight", 0.7),
+                keyword_weight=plan.get("bm25_weight", 0.3)
+            )
+            
+            return blended_results
             
         except Exception as e:
-            logger.warning(f"Reranking failed, using original order: {e}")
-            return documents
+            logger.warning(f"Hybrid search failed, falling back to vector: {e}")
+            return await self.vector_store.similarity_search(
+                collection_name, query_embedding, top_k
+            )
     
-    def _calculate_metadata_score(self, metadata: Dict[str, Any]) -> float:
-        """Calculate a score based on metadata quality"""
-        score = 0.0
-        
-        # Prefer documents with more metadata
-        if metadata.get("file_type") in [".pdf", ".md"]:
-            score += 0.1
-        
-        # Prefer longer documents
-        text_length = metadata.get("text_length", 0)
-        if text_length > 1000:
-            score += 0.2
-        elif text_length > 500:
-            score += 0.1
-        
-        # Prefer documents with chunk index 0 (first chunk)
-        if metadata.get("chunk_index", 0) == 0:
-            score += 0.1
-        
-        return min(score, 1.0)
-    
-    async def _generate_answer(self, question: str, documents: List[Tuple[Any, float]], 
-                             include_metadata: bool) -> Tuple[str, List[Dict[str, Any]], int]:
-        """Generate answer using OpenAI GPT"""
+    async def _generate_answer(self, question: str, documents: List[Tuple[Any, float]]) -> Tuple[str, List[Dict], List[str], int]:
+        """Generate answer with strict grounding"""
         try:
-            # Prepare context from documents
+            # Prepare context and sources
             context_parts = []
             sources = []
+            contexts = []
             
             for i, (doc, score) in enumerate(documents):
-                context_parts.append(f"Document {i+1}:\n{doc.page_content}")
+                # Add to context
+                context_parts.append(f"Source {i+1}:\n{doc.page_content}")
+                contexts.append(doc.page_content)
                 
+                # Prepare source metadata
                 source_info = {
-                    "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
-                    "relevance_score": round(score, 3),
                     "source": doc.metadata.get("source", "Unknown"),
-                    "chunk_index": doc.metadata.get("chunk_index", 0)
+                    "relevance_score": round(score, 3),
+                    "section_title": doc.metadata.get("section_title", "Unknown"),
+                    "page_num": doc.metadata.get("page_num", 0),
+                    "chunk_index": doc.metadata.get("chunk_index", 0),
+                    "file_name": doc.metadata.get("file_name", "Unknown"),
+                    "file_type": doc.metadata.get("file_type", "Unknown"),
+                    "doc_title": doc.metadata.get("doc_title", "Unknown")
                 }
-                
-                if include_metadata:
-                    source_info.update({
-                        "file_name": doc.metadata.get("file_name", "Unknown"),
-                        "file_type": doc.metadata.get("file_type", "Unknown"),
-                        "chunk_size": doc.metadata.get("chunk_size", 0)
-                    })
-                
                 sources.append(source_info)
             
             context = "\n\n".join(context_parts)
             
-            # Create prompt
-            prompt = f"""Based on the following documents, please answer the question. 
-            If the answer cannot be found in the documents, say so clearly.
-            Provide specific citations by referencing "Document X" in your answer.
-
-            Question: {question}
-
-            Documents:
-            {context}
-
-            Answer:"""
+            # Create prompts
+            system_prompt = self.prompt_templates.get_system_prompt(
+                "strict_grounding",
+                max_tokens=settings.max_tokens,
+                require_citations=True
+            )
+            
+            user_prompt = self.prompt_templates.create_user_prompt(
+                question, context, sources
+            )
             
             # Generate answer
             response = await self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that answers questions based on provided documents. Always cite your sources."},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=1000,
-                temperature=0.1
+                max_tokens=settings.max_tokens,
+                temperature=0.1,
+                top_p=0.9
             )
             
             answer = response.choices[0].message.content
             tokens_used = response.usage.total_tokens if response.usage else 0
             
-            return answer, sources, tokens_used
+            return answer, sources, contexts, tokens_used
             
         except Exception as e:
             logger.error(f"Answer generation failed: {e}")
-            return f"Error generating answer: {str(e)}", [], 0
+            return f"Error generating answer: {str(e)}", [], [], 0
     
-    def _calculate_confidence(self, documents: List[Tuple[Any, float]]) -> float:
-        """Calculate confidence score based on retrieved documents"""
+    def _calculate_confidence(self, documents: List[Tuple[Any, float]], plan_confidence: float) -> float:
+        """Calculate confidence score"""
         if not documents:
             return 0.0
         
-        # Average similarity score
-        avg_score = sum(score for _, score in documents) / len(documents)
+        # Base confidence from top document score
+        top_score = documents[0][1] if documents else 0.0
         
-        # Boost confidence if we have multiple high-quality documents
-        if len(documents) >= 3:
-            avg_score *= 1.1
+        # Diversity bonus
+        unique_sources = len(set(doc.metadata.get("source", "") for doc, _ in documents))
+        diversity_bonus = min(0.2, unique_sources * 0.05)
         
-        # Cap at 1.0
-        return min(avg_score, 1.0)
+        # Plan confidence influence
+        plan_influence = plan_confidence * 0.1
+        
+        # Calculate final confidence
+        final_confidence = top_score + diversity_bonus + plan_influence
+        
+        return min(1.0, final_confidence)
+    
+    async def answer_question_streaming(self, question: str, collection_name: str, 
+                                      top_k: int = 10, use_hybrid: bool = True, 
+                                      use_reranking: bool = True) -> AsyncGenerator[str, None]:
+        """Stream answer as it's generated"""
+        try:
+            # Get documents (same as regular query)
+            query_embedding = await self.embedding_service.embed_query(question)
+            
+            if use_hybrid:
+                documents = await self._hybrid_retrieval(
+                    question, query_embedding, collection_name, top_k, {}
+                )
+            else:
+                documents = await self.vector_store.similarity_search(
+                    collection_name, query_embedding, top_k
+                )
+            
+            if not documents:
+                yield "No relevant documents found for your question."
+                return
+            
+            # Rerank if requested
+            if use_reranking and len(documents) > 1:
+                documents = await self.reranking_service.rerank_documents(
+                    question, documents, 5
+                )
+            
+            # Prepare context
+            context_parts = []
+            for i, (doc, score) in enumerate(documents):
+                context_parts.append(f"Source {i+1}:\n{doc.page_content}")
+            
+            context = "\n\n".join(context_parts)
+            
+            # Create streaming prompt
+            user_prompt = self.prompt_templates.create_streaming_prompt(
+                question, context, []
+            )
+            
+            # Stream response
+            async for chunk in self._stream_generation(user_prompt):
+                yield chunk
+                
+        except Exception as e:
+            logger.error(f"Streaming query failed: {e}")
+            yield f"Error: {str(e)}"
+    
+    async def _stream_generation(self, user_prompt: str) -> AsyncGenerator[str, None]:
+        """Stream generation from OpenAI"""
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant. Provide accurate, cited responses."},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=settings.max_tokens,
+                temperature=0.1,
+                stream=True
+            )
+            
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+                    
+        except Exception as e:
+            logger.error(f"Streaming generation failed: {e}")
+            yield f"Error: {str(e)}"
